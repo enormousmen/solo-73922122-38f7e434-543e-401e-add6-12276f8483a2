@@ -44,6 +44,11 @@ class Order:
     acked_seq: int = -1                                       # highest contiguous ack
     state: ModelState | None = None
     last_batch_size: int = 0                                 # diagnostics
+    # Delivery ledger, bounded to the MAX_BACKLOG unconfirmed window.  Bit i
+    # means "seq acked_seq+1+i was carried by a response the server finished
+    # sending successfully".  It is an 8-bit mask (one slot per credit), never
+    # a structure that grows with ``total``.
+    delivered_mask: int = 0
 
     @property
     def generated(self) -> int:
@@ -67,6 +72,77 @@ class Order:
         if self.has_remaining:
             return OrderStatus.ACTIVE if self.has_budget else OrderStatus.PAUSED
         return OrderStatus.DONE
+
+    # ----------------------------------------------------------- #
+    # Delivery bookkeeping (constant-size, one bit per credit)
+    # ----------------------------------------------------------- #
+    def mark_delivered(self, start: int, end: int) -> None:
+        """Record absolute seq numbers in ``[start, end)`` as fully sent.
+
+        Only seqs inside the current unconfirmed window have a slot.  Seqs at
+        or below the acked watermark are already confirmed and irrelevant;
+        seqs beyond the window cannot occur because the back-pressure cap stops
+        generation exactly at the window boundary.
+        """
+        base = self.acked_seq + 1
+        for seq in range(max(start, base), end):
+            idx = seq - base
+            if 0 <= idx < MAX_BACKLOG:
+                self.delivered_mask |= 1 << idx
+
+    def can_ack_through(self, seq: int) -> bool:
+        """Whether ``acked_seq+1 .. seq`` are all on record as delivered."""
+        count = seq - self.acked_seq  # number of seqs that would be newly acked
+        if count <= 0:
+            return True
+        if count > MAX_BACKLOG:
+            return False
+        low_bits = (1 << count) - 1
+        return (self.delivered_mask & low_bits) == low_bits
+
+    def advance_watermark(self, seq: int) -> None:
+        """Move the acked watermark to ``seq`` and align the delivery window.
+
+        The low ``count`` bits are the contiguous prefix just confirmed.
+        Shifting them out keeps any out-of-order tail (a back slice received
+        early) recorded against the new base.
+        """
+        count = seq - self.acked_seq
+        if count > 0:
+            self.delivered_mask >>= count
+            self.acked_seq = seq
+
+    @property
+    def delivered_seqs(self) -> list[int]:
+        """Absolute seqs currently marked delivered (at most MAX_BACKLOG)."""
+        base = self.acked_seq + 1
+        return [base + i for i in range(MAX_BACKLOG)
+                if self.delivered_mask & (1 << i)]
+
+    @property
+    def delivered(self) -> set[int]:
+        """Set view of :attr:`delivered_seqs` (bounded to the window)."""
+        return set(self.delivered_seqs)
+
+    @property
+    def delivery(self) -> list[bool]:
+        """Fixed ``MAX_BACKLOG``-slot view of the window (bit i -> base+i)."""
+        return [bool(self.delivered_mask & (1 << i))
+                for i in range(MAX_BACKLOG)]
+
+    @property
+    def delivered_contig_seq(self) -> int:
+        """Highest seq reachable by a contiguous delivered prefix.
+
+        Equals ``acked_seq`` when the very next seq is missing.  An ack may
+        only advance up to this sequence number.
+        """
+        run = 0
+        bits = self.delivered_mask
+        while run < MAX_BACKLOG and (bits & 1):
+            run += 1
+            bits >>= 1
+        return self.acked_seq + run
 
 
 class EngineError(Exception):
@@ -171,47 +247,104 @@ class GenerationEngine:
             self.orders[order_id] = order
             return self._snapshot(order)
 
+    def _slice_locked(self, order: Order, start: int, end: int) -> dict:
+        """Build the slice payload. Caller holds ``self._lock``."""
+        if start < 0 or end < start:
+            raise EngineError("invalid range: require 0 <= start <= end")
+        available = order.generated
+        if start >= available:
+            raise SeqOutOfRange(
+                f"seq {start} not generated yet (have 0..{available - 1})")
+        end = min(end, available)
+        ids = order.tokens[start:end]
+        return {
+            "order_id": order.order_id,
+            "start": start,
+            "end": end,
+            "text": self.model.decode(ids),
+            "next_seq": end,
+            "generated": available,
+            "total": order.total,
+            "status": order.status.value,
+            "replayed": True,  # identical bytes on every call
+        }
+
+    async def prepare_slice(self, order_id: str, start: int, end: int) -> dict:
+        """Validate and build a slice WITHOUT recording delivery.
+
+        The HTTP layer calls this under a short lock, sends the body without
+        holding the lock, and only then calls :meth:`mark_delivered` if the
+        whole body was sent successfully.
+        """
+        async with self._lock:
+            order = self._require_order(order_id)
+            return self._slice_locked(order, start, end)
+
+    # Convenience aliases for the two-phase delivery protocol.
+    take_slice = prepare_slice
+
+    async def mark_delivered(self, order_id: str, start: int, end: int) -> dict:
+        """Record ``[start, end)`` as carried by a fully-sent response."""
+        async with self._lock:
+            order = self.orders.get(order_id)
+            if order is None:
+                raise OrderNotFound(f"unknown order {order_id!r}")
+            order.mark_delivered(start, end)
+            return order_to_dict(order)
+
+    commit_delivery = mark_delivered
+    record_delivery = mark_delivered
+    mark_sent = mark_delivered
+
     async def fetch(self, order_id: str, start: int, end: int) -> dict:
         """Return tokens with sequence numbers in ``[start, end)``.
 
         The fragment is served from the retained token buffer, so fetching a
         range again returns byte-identical text (re-fetch of unacked data).
+
+        For in-process callers receiving the whole dict at once, a successful
+        return also records the slice as delivered.  The HTTP transport uses
+        :meth:`prepare_slice` + :meth:`mark_delivered` instead so that a failed
+        or cancelled network send is not counted.
         """
         async with self._lock:
             order = self._require_order(order_id)
-            if start < 0 or end < start:
-                raise EngineError("invalid range: require 0 <= start <= end")
-            available = order.generated
-            if start >= available:
-                raise SeqOutOfRange(
-                    f"seq {start} not generated yet (have 0..{available - 1})")
-            end = min(end, available)
-            ids = order.tokens[start:end]
-            return {
-                "order_id": order_id,
-                "start": start,
-                "end": end,
-                "text": self.model.decode(ids),
-                "next_seq": end,
-                "generated": available,
-                "total": order.total,
-                "status": order.status.value,
-                "replayed": True,  # identical bytes on every call
-            }
+            payload = self._slice_locked(order, start, end)
+            order.mark_delivered(payload["start"], payload["end"])
+            return payload
 
     async def acknowledge(self, order_id: str, seq: int) -> dict:
         async with self._lock:
             order = self._require_order(order_id)
-            delivered_max = order.generated - 1
-            if seq > delivered_max:
-                # Refuse to acknowledge beyond the contiguous high-water mark.
-                raise AckRejected(
-                    f"ack seq {seq} exceeds max delivered seq {delivered_max}")
             before = order.acked_seq
-            applied = seq > before
-            if applied:
-                # New contiguous acknowledgement: free credit.
-                order.acked_seq = seq
+
+            if seq <= before:
+                # Duplicate (seq == before) or late/smaller ack: idempotent,
+                # frees no extra credit and is never a 409.
+                applied = False
+            else:
+                generated_max = order.generated - 1
+                if seq > generated_max:
+                    # Nothing at that sequence number exists yet.
+                    raise AckRejected(
+                        f"ack seq {seq} exceeds max generated seq {generated_max}")
+                if not order.can_ack_through(seq):
+                    # The seqs after the last ack must have been *continuously
+                    # returned* (fully delivered) up to ``seq``.  A gap means
+                    # the annotator only holds an out-of-order back slice, so
+                    # confirming its tail must not free the missing front's
+                    # credit.  State is left untouched.
+                    have = set(order.delivered_seqs)
+                    missing = [s for s in range(before + 1, seq + 1)
+                               if s not in have]
+                    raise AckRejected(
+                        f"ack seq {seq} refused: seqs {before + 1}..{seq} were "
+                        f"not all continuously delivered (contiguous delivered "
+                        f"through #{order.delivered_contig_seq}); missing "
+                        f"{missing[:8]}")
+                order.advance_watermark(seq)
+                applied = True
+
             # Duplicate (seq <= before) or late ack frees nothing.
             result = order_to_dict(order)
             result["acked_seq_before"] = before
@@ -244,6 +377,7 @@ class GenerationEngine:
             acked_seq=order.acked_seq,
             state=None,  # model state is never exposed
             last_batch_size=order.last_batch_size,
+            delivered_mask=order.delivered_mask,
         )
 
 
@@ -257,4 +391,8 @@ def order_to_dict(order: Order) -> dict:
         "max_backlog": MAX_BACKLOG,
         "status": order.status.value,
         "last_batch_size": order.last_batch_size,
+        # Highest seq that may currently be acked without a 409, plus the
+        # bounded set of out-of-order seqs already on record as delivered.
+        "delivered_contig_seq": order.delivered_contig_seq,
+        "delivered_seqs": order.delivered_seqs,
     }

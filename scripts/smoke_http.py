@@ -109,6 +109,9 @@ async def main() -> None:
                 for _ in range(400):
                     info = (await c.get(f"{BASE}/api/orders/B")).json()
                     if info["generated"] > high:
+                        # delivery protocol: return the slice before acking it
+                        await c.get(
+                            f"{BASE}/api/orders/B/tokens?start=0&end={info['generated']}")
                         await c.post(f"{BASE}/api/orders/B/ack",
                                      json={"seq": info["generated"] - 1})
                         high = info["generated"]
@@ -155,10 +158,12 @@ async def main() -> None:
             print(f"  前 8 字与停读前一致: {again['text'][:8] == before}")
             assert again["text"][:8] == before
 
-            banner("7. 持续确认直到 A 全部完成")
+            banner("7. 持续取片并确认直到 A 全部完成")
             for _ in range(400):
                 info = (await c.get(f"{BASE}/api/orders/A")).json()
                 if info["generated"] >= 1:
+                    await c.get(
+                        f"{BASE}/api/orders/A/tokens?start=0&end={info['generated']}")
                     await c.post(f"{BASE}/api/orders/A/ack",
                                  json={"seq": info["generated"] - 1})
                 if info["status"] == "done":

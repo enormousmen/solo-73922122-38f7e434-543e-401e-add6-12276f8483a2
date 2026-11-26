@@ -37,6 +37,8 @@ async def test_backlog_cap_pauses_order_and_other_keeps_generating(gen_engine):
     # A stops reading and never acks.  B keeps acknowledging, so it retains
     # budget and continues alone while A stays frozen at its old progress.
     for _ in range(5):
+        # New protocol: the slice must be returned before its tail is ackable.
+        await gen_engine.fetch("B", 0, b.generated)
         await gen_engine.acknowledge("B", b.generated - 1)
         assert await gen_engine.step() == 1
     a, b = gen_engine.orders["A"], gen_engine.orders["B"]
@@ -52,6 +54,8 @@ async def test_ack_frees_credit_and_resumes_from_same_progress(gen_engine):
     frozen_tokens = list(a.tokens)
     assert a.status.value == "paused"
 
+    # New protocol: seq 0..3 must be returned before they are acknowledged.
+    await gen_engine.fetch("A", 0, 4)
     # Acknowledge the first 4 contiguous tokens (seq 0..3)
     info = await gen_engine.acknowledge("A", 3)
     assert info["backlog"] == 4
@@ -81,6 +85,7 @@ async def test_ack_beyond_delivered_high_water_is_rejected(gen_engine):
 async def test_duplicate_and_late_acks_free_no_extra_credit(gen_engine):
     await gen_engine.create_order("A", "x", length=20)
     await run_ticks(gen_engine, 8)
+    await gen_engine.fetch("A", 0, 4)  # deliver seq 0..3 before acking them
     first = await gen_engine.acknowledge("A", 3)
     assert first["credit_freed"] == 4 and first["ack_applied"] is True
 
@@ -149,7 +154,10 @@ async def test_two_orders_batched_generation_matches_reference_decode(gen_engine
     await gen_engine.create_order("B", "other", length=10)
     for k in range(10):
         assert await gen_engine.step() == 2
-        # free credit continuously so neither order pauses
+        # New protocol: deliver seq k, then acknowledge it, so credit frees
+        # continuously and neither order pauses.
+        await gen_engine.fetch("A", k, k + 1)
+        await gen_engine.fetch("B", k, k + 1)
         await gen_engine.acknowledge("A", k)
         await gen_engine.acknowledge("B", k)
     assert gen_engine.orders["A"].tokens == ref

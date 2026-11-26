@@ -43,6 +43,10 @@ async def test_full_two_stream_demo_flow(client):
         for _ in range(600):
             info = (await client.get("/api/orders/B")).json()
             if info["generated"] > high:
+                # Return the fresh contiguous slice first; only returned
+                # sequences are ackable under the delivery protocol.
+                await client.get(
+                    f"/api/orders/B/tokens?start=0&end={info['generated']}")
                 await client.post("/api/orders/B/ack",
                                   json={"seq": info["generated"] - 1})
                 high = info["generated"]
@@ -85,11 +89,13 @@ async def test_full_two_stream_demo_flow(client):
     assert again["text"][:8] == before  # old bytes preserved
     assert len(again["text"]) == 12
 
-    # 9. ack everything delivered so A can run to completion
+    # 9. deliver + ack everything generated so A can run to completion
     async def drain_a():
         for _ in range(600):
             info = (await client.get("/api/orders/A")).json()
             if info["generated"] >= 1:
+                await client.get(
+                    f"/api/orders/A/tokens?start=0&end={info['generated']}")
                 await client.post("/api/orders/A/ack",
                                   json={"seq": info["generated"] - 1})
             if info["status"] == "done":

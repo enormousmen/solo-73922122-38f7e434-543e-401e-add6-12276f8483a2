@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .engine import EngineError, GenerationEngine, MAX_BACKLOG, order_to_dict
@@ -93,10 +93,36 @@ async def get_order(order_id: str) -> dict:
 
 
 @app.get("/api/orders/{order_id}/tokens")
-async def fetch_tokens(order_id: str, start: int = 0, end: int | None = None) -> dict:
+async def fetch_tokens(order_id: str, start: int = 0, end: int | None = None):
     if end is None:
         end = start + 1
-    return await engine.fetch(order_id, start, end)
+    # Build the slice under the engine lock, then release the lock before any
+    # network I/O so a slow/half-open response cannot block the other order,
+    # acks or the generation ticker.
+    payload = await engine.prepare_slice(order_id, start, end)
+    body = JSONResponse(payload).body
+    seq_start, seq_end = payload["start"], payload["end"]
+
+    async def body_iter():
+        # Yield the whole JSON body once.  Everything after the yield runs
+        # only when Starlette resumes this generator after the chunk was sent
+        # successfully:
+        #   * normal completion  -> resume here, record delivery;
+        #   * send error / client disconnect / task cancellation -> the
+        #     generator is closed at the yield point (GeneratorExit /
+        #     CancelledError), so the mark below never runs.  An unfinished
+        #     response therefore cannot fill an acknowledgement gap.
+        yield body
+        await engine.mark_delivered(order_id, seq_start, seq_end)
+
+    return StreamingResponse(
+        body_iter(),
+        media_type="application/json",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        },
+    )
 
 
 @app.post("/api/orders/{order_id}/ack")

@@ -178,6 +178,7 @@ class OrderPanel {
     this.nextSeq = 0;            // next seq to fetch
     this.highFetched = -1;       // highest seq ever fetched
     this.ackedSeq = -1;
+    this.deliveredContig = -1;   // highest continuously delivered seq (ack gate)
     this.generated = 0;
     this.total = 0;
     this.status = null;
@@ -217,6 +218,7 @@ class OrderPanel {
 
   resetView(o) {
     this.nextSeq = 0; this.highFetched = -1; this.ackedSeq = -1;
+    this.deliveredContig = -1;
     this.generated = o.generated; this.total = o.total;
     this.refetchMarks.clear();
     $(`stream-${this.id}`).innerHTML = '';
@@ -352,6 +354,10 @@ class OrderPanel {
   renderStats(o) {
     const backlog = o.backlog ?? (this.generated - (this.ackedSeq + 1));
     const status = o.status ?? this.status ?? 'idle';
+    if (typeof o.delivered_contig_seq === 'number') {
+      this.deliveredContig = o.delivered_contig_seq;
+    }
+    const contigText = this.deliveredContig < 0 ? '–' : '#' + this.deliveredContig;
     $('status-' + this.id).textContent = status;
     $('gen-' + this.id).textContent = `${o.generated ?? this.generated}/${o.total ?? this.total}`;
     $('backlog-' + this.id).textContent = `${backlog}/8`;
@@ -365,7 +371,7 @@ class OrderPanel {
     badge.textContent = status;
     badge.className = 'badge ' + (['active', 'paused', 'done'].includes(status) ? status : 'idle');
     $('meta-' + this.id).textContent =
-      `下一次取序号 #${this.nextSeq} · 已取到 #${this.highFetched} · 该路最近合批 ${o.last_batch_size ?? '–'} 路`;
+      `下一次取序号 #${this.nextSeq} · 已取到 #${this.highFetched} · 已连续送达可确认到 ${contigText} · 该路最近合批 ${o.last_batch_size ?? '–'} 路`;
   }
 }
 
