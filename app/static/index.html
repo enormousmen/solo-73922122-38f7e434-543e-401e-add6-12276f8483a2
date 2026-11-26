@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>双路续写标注台 · NumPy 自回归演示</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #182033; --panel2: #1f2a44;
+    --line: #2b3a5c; --text: #e6ecf7; --muted: #8ea0c0;
+    --accent: #5aa9ff; --green: #46d39a; --amber: #f5b942; --red: #ff6b6b;
+    --purple: #b58cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--line);
+           display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  .global { color: var(--muted); font-size: 13px; }
+  .global b { color: var(--accent); }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 24px; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .panel h2 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 10px; }
+  .badge { font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); }
+  .badge.active { color: var(--green); border-color: var(--green); }
+  .badge.paused { color: var(--amber); border-color: var(--amber); }
+  .badge.done   { color: var(--purple); border-color: var(--purple); }
+  .badge.idle   { color: var(--muted); }
+  label { color: var(--muted); font-size: 12px; display: block; margin-bottom: 2px; }
+  input, textarea, select, button {
+    font: inherit; color: var(--text); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; width: 100%; }
+  textarea { min-height: 54px; resize: vertical; font-family: ui-monospace, monospace; }
+  .row { display: grid; grid-template-columns: 3fr 1fr; gap: 10px; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { width: auto; cursor: pointer; transition: filter .15s; }
+  button:hover:not(:disabled) { filter: brightness(1.25); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: #2357a6; border-color: #2f6fd1; }
+  button.stop { background: #7a3535; border-color: #a04848; }
+  button.go { background: #1f6b4d; border-color: #2c946c; }
+  button.ack { background: #6b5410; border-color: #a07f22; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; font-size: 12px; }
+  .stat { background: var(--panel2); border: 1px solid var(--line);
+          border-radius: 8px; padding: 6px 8px; }
+  .stat .k { color: var(--muted); }
+  .stat .v { font-size: 15px; font-weight: 600; }
+  .bar { height: 6px; background: var(--panel2); border-radius: 999px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+  .bar i.full { background: var(--red); }
+  .stream { background: #0b101c; border: 1px solid var(--line); border-radius: 8px;
+            padding: 10px; min-height: 150px; max-height: 260px; overflow: auto;
+            font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+            white-space: pre-wrap; word-break: break-all; }
+  .stream .tok { border-radius: 3px; }
+  .stream .tok:hover { background: #2b3a5c; }
+  .stream .replayed { background: rgba(181, 140, 255, .28); outline: 1px solid var(--purple); }
+  .stream .acked { color: var(--muted); }
+  .meta { font-size: 12px; color: var(--muted); }
+  .err { color: var(--red); font-size: 12px; min-height: 16px; }
+  footer { padding: 0 24px 24px; }
+  .log { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+         padding: 12px 16px; max-height: 220px; overflow: auto;
+         font-family: ui-monospace, monospace; font-size: 12px; }
+  .log .t { color: var(--muted); }
+  .log .ok { color: var(--green); } .log .warn { color: var(--amber); }
+  .log .info { color: var(--accent); } .log .bad { color: var(--red); }
+  .hint { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>双路续写标注台</h1>
+  <span class="global">CPU NumPy 小模型 · 字符级贪心解码（结果可复现，支持原样重取）</span>
+  <span class="global">tick <b id="tick">0</b> · 最近合批 <b id="batch">–</b> 路 · 每路未确认上限 <b>8</b> token</span>
+</header>
+
+<main>
+  <!-- ============================ Panel A ============================ -->
+  <section class="panel" id="panel-A">
+    <h2>订单 A <span class="badge idle" id="badge-A">未创建</span></h2>
+    <div>
+      <label>前缀 prefix</label>
+      <textarea id="prefix-A">The quick brown fox</textarea>
+    </div>
+    <div class="row">
+      <div>
+        <label>续写长度（token 数）</label>
+        <input type="number" id="length-A" value="40" min="1" max="10000">
+      </div>
+      <div style="align-self:end">
+        <button class="primary" id="create-A">创建并开始读</button>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">状态</div><div class="v" id="status-A">–</div></div>
+      <div class="stat"><div class="k">已生成 / 总量</div><div class="v" id="gen-A">0/0</div></div>
+      <div class="stat"><div class="k">未确认 backlog</div><div class="v" id="backlog-A">0/8</div></div>
+      <div class="stat"><div class="k">已确认到序号</div><div class="v" id="acked-A">–</div></div>
+    </div>
+    <div class="bar"><i id="bar-A" style="width:0%"></i></div>
+    <div class="btns">
+      <button class="stop" id="stop-A" disabled>停读</button>
+      <button class="go" id="resume-A" disabled>续读</button>
+      <button id="refetch-A" disabled>重取未确认片段</button>
+      <button class="ack" id="ack-A" disabled>确认已读（腾额度）</button>
+    </div>
+    <div class="stream" id="stream-A"></div>
+    <div class="meta" id="meta-A">尚未创建订单</div>
+    <div class="err" id="err-A"></div>
+  </section>
+
+  <!-- ============================ Panel B ============================ -->
+  <section class="panel" id="panel-B">
+    <h2>订单 B <span class="badge idle" id="badge-B">未创建</span></h2>
+    <div>
+      <label>前缀 prefix</label>
+      <textarea id="prefix-B">The quick brown fox</textarea>
+    </div>
+    <div class="row">
+      <div>
+        <label>续写长度（token 数）</label>
+        <input type="number" id="length-B" value="40" min="1" max="10000">
+      </div>
+      <div style="align-self:end">
+        <button class="primary" id="create-B">创建并开始读</button>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">状态</div><div class="v" id="status-B">–</div></div>
+      <div class="stat"><div class="k">已生成 / 总量</div><div class="v" id="gen-B">0/0</div></div>
+      <div class="stat"><div class="k">未确认 backlog</div><div class="v" id="backlog-B">0/8</div></div>
+      <div class="stat"><div class="k">已确认到序号</div><div class="v" id="acked-B">–</div></div>
+    </div>
+    <div class="bar"><i id="bar-B" style="width:0%"></i></div>
+    <div class="btns">
+      <button class="stop" id="stop-B" disabled>停读</button>
+      <button class="go" id="resume-B" disabled>续读</button>
+      <button id="refetch-B" disabled>重取未确认片段</button>
+      <button class="ack" id="ack-B" disabled>确认已读（腾额度）</button>
+    </div>
+    <div class="stream" id="stream-B"></div>
+    <div class="meta" id="meta-B">尚未创建订单</div>
+    <div class="err" id="err-B"></div>
+  </section>
+</main>
+
+<footer>
+  <p class="hint">
+    演示路径：两路同时创建 → 观察“最近合批=2”；在 A 点<b>停读</b>，B 仍持续出字，A 攒满 8 个未确认后自动暂停；
+    点 <b>重取未确认片段</b>（紫色高亮，文本与此前逐字一致）；点 <b>确认已读</b> 腾出额度，再点 <b>续读</b>，A 从原进度继续。
+  </p>
+  <div class="log" id="log"></div>
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+function log(msg, cls = '') {
+  const el = $('log');
+  const line = document.createElement('div');
+  line.innerHTML = `<span class="t">${new Date().toLocaleTimeString('zh-CN', {hour12:false})}</span> ` +
+                   `<span class="${cls}">${esc(msg)}</span>`;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+class OrderPanel {
+  constructor(id) {
+    this.id = id;
+    this.polling = false;
+    this.pollToken = 0;          // bumped on stop to cancel in-flight loop
+    this.nextSeq = 0;            // next seq to fetch
+    this.highFetched = -1;       // highest seq ever fetched
+    this.ackedSeq = -1;
+    this.generated = 0;
+    this.total = 0;
+    this.status = null;
+    this.refetchMarks = new Set();
+    for (const ev of [['create', this.create], ['stop', this.stop],
+                      ['resume', this.resume], ['refetch', this.refetch],
+                      ['ack', this.ack]]) {
+      $(`${ev[0]}-${id}`).addEventListener('click', () => ev[1].call(this));
+    }
+  }
+
+  setErr(msg) { $(`err-${this.id}`).textContent = msg || ''; }
+
+  async api(path, opts) {
+    const r = await fetch(path, opts);
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    return data;
+  }
+
+  async create() {
+    this.setErr('');
+    const prefix = $(`prefix-${this.id}`).value;
+    const length = parseInt($(`length-${this.id}`).value, 10);
+    try {
+      const o = await this.api('/api/orders', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({order_id: this.id, prefix, length}),
+      });
+      this.resetView(o);
+      log(`订单 ${this.id} 已创建：长度 ${o.total}，前缀 ${JSON.stringify(prefix.slice(0, 24))}`, 'ok');
+      this.startPolling();
+    } catch (e) {
+      this.setErr(e.message); log(`订单 ${this.id} 创建失败：${e.message}`, 'bad');
+    }
+  }
+
+  resetView(o) {
+    this.nextSeq = 0; this.highFetched = -1; this.ackedSeq = -1;
+    this.generated = o.generated; this.total = o.total;
+    this.refetchMarks.clear();
+    $(`stream-${this.id}`).innerHTML = '';
+    $('create-' + this.id).disabled = true;
+    $('stop-' + this.id).disabled = false;
+    $('resume-' + this.id).disabled = true;
+    $('refetch-' + this.id).disabled = false;
+    $('ack-' + this.id).disabled = false;
+    this.renderStats(o);
+  }
+
+  startPolling() {
+    if (this.polling) return;
+    this.polling = true;
+    const token = ++this.pollToken;
+    $('stop-' + this.id).disabled = false;
+    $('resume-' + this.id).disabled = true;
+    log(`订单 ${this.id} 开始/继续轮询读取`, 'info');
+    this.loop(token);
+  }
+
+  stop() {
+    if (!this.polling) return;
+    this.polling = false;
+    this.pollToken++;
+    $('stop-' + this.id).disabled = true;
+    $('resume-' + this.id).disabled = false;
+    log(`订单 ${this.id} 停读（服务端仍按额度生成，backlog 满 8 后该路暂停）`, 'warn');
+  }
+
+  resume() { this.startPolling(); }
+
+  async loop(token) {
+    while (this.polling && token === this.pollToken) {
+      try {
+        // 每次最多取 2 个序号，贴近“按序号取文本”的交互
+        const end = Math.min(this.nextSeq + 2, this.total);
+        if (this.nextSeq >= this.total) break;
+        const r = await this.api(
+          `/api/orders/${this.id}/tokens?start=${this.nextSeq}&end=${end}`);
+        if (token !== this.pollToken) return;
+        this.appendText(r.text, r.start);
+        this.nextSeq = r.next_seq;
+        this.highFetched = Math.max(this.highFetched, r.end - 1);
+        this.generated = r.generated; this.total = r.total; this.status = r.status;
+        this.renderStats(r);
+        if (r.status === 'done' && this.nextSeq >= this.total) {
+          this.polling = false;
+          $('stop-' + this.id).disabled = true;
+          $('resume-' + this.id).disabled = true;
+          log(`订单 ${this.id} 已全部生成并取完`, 'ok');
+          break;
+        }
+      } catch (e) {
+        // 序号尚未生成时 404 属正常背压，静默重试
+        if (!/not generated/.test(e.message)) {
+          this.setErr(e.message);
+          log(`订单 ${this.id} 读取错误：${e.message}`, 'bad');
+        }
+      }
+      await sleep(180);
+    }
+  }
+
+  appendText(text, startSeq, replayed = false) {
+    const stream = $(`stream-${this.id}`);
+    const atBottom = stream.scrollTop + stream.clientHeight >= stream.scrollHeight - 8;
+    [...text].forEach((ch, i) => {
+      const seq = startSeq + i;
+      if (replayed) this.refetchMarks.add(seq);
+      const span = document.createElement('span');
+      span.className = 'tok' + (replayed ? ' replayed' : '') +
+                       (seq <= this.ackedSeq ? ' acked' : '');
+      span.dataset.seq = seq;
+      span.title = `seq #${seq}`;
+      span.textContent = ch;
+      stream.appendChild(span);
+    });
+    if (atBottom) stream.scrollTop = stream.scrollHeight;
+  }
+
+  async refetch() {
+    this.setErr('');
+    const start = this.ackedSeq + 1;
+    const end = this.highFetched + 1;
+    if (start >= end) { log(`订单 ${this.id} 没有未确认片段可重取`, 'warn'); return; }
+    try {
+      const r = await this.api(
+        `/api/orders/${this.id}/tokens?start=${start}&end=${end}`);
+      // 校验：重取文本必须与缓冲中已显示的字符逐字一致
+      const oldText = [...$(`stream-${this.id}`).querySelectorAll('.tok')]
+        .filter(s => +s.dataset.seq >= start && +s.dataset.seq < end)
+        .map(s => s.textContent).join('');
+      const same = oldText === r.text;
+      log(`订单 ${this.id} 重取 seq ${start}..${end - 1}（${r.end - r.start} 字），` +
+          `与原片段${same ? '完全一致 ✓' : '不一致 ✗'}`, same ? 'ok' : 'bad');
+      // 另起一行展示重取结果（紫色），不破坏原始流
+      const marker = document.createElement('div');
+      marker.style.color = 'var(--purple)';
+      marker.style.marginTop = '6px';
+      marker.textContent = `↳ 重取 [#${start}..#${end - 1}]：${r.text}`;
+      $('stream-' + this.id).appendChild(marker);
+    } catch (e) {
+      this.setErr(e.message); log(`订单 ${this.id} 重取失败：${e.message}`, 'bad');
+    }
+  }
+
+  async ack() {
+    this.setErr('');
+    if (this.highFetched < 0) { log(`订单 ${this.id} 还没有可确认的 token`, 'warn'); return; }
+    const seq = this.highFetched;
+    try {
+      const o = await this.api(`/api/orders/${this.id}/ack`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({seq}),
+      });
+      this.ackedSeq = o.acked_seq;
+      this.renderStats(o);
+      $(`stream-${this.id}`).querySelectorAll('.tok').forEach(s => {
+        if (+s.dataset.seq <= seq) s.classList.add('acked');
+      });
+      log(`订单 ${this.id} 确认到 seq #${seq}：${o.ack_applied ? '腾出额度 ' + o.credit_freed : '重复/迟到确认，未腾额度'}，` +
+          `backlog=${o.backlog}/8，状态=${o.status}`, o.ack_applied ? 'ok' : 'warn');
+      if (o.status === 'active' && !this.polling) {
+        log(`订单 ${this.id} 额度已恢复，可点“续读”继续`, 'info');
+      }
+    } catch (e) {
+      this.setErr(e.message);
+      log(`订单 ${this.id} 确认被拒绝：${e.message}`, 'bad');
+    }
+  }
+
+  renderStats(o) {
+    const backlog = o.backlog ?? (this.generated - (this.ackedSeq + 1));
+    const status = o.status ?? this.status ?? 'idle';
+    $('status-' + this.id).textContent = status;
+    $('gen-' + this.id).textContent = `${o.generated ?? this.generated}/${o.total ?? this.total}`;
+    $('backlog-' + this.id).textContent = `${backlog}/8`;
+    $('acked-' + this.id).textContent = this.ackedSeq < 0 ? '–' : '#' + this.ackedSeq;
+    const total = o.total ?? this.total;
+    const pct = total ? 100 * (o.generated ?? this.generated) / total : 0;
+    const bar = $('bar-' + this.id);
+    bar.style.width = pct.toFixed(1) + '%';
+    bar.className = backlog >= 8 ? 'full' : '';
+    const badge = $('badge-' + this.id);
+    badge.textContent = status;
+    badge.className = 'badge ' + (['active', 'paused', 'done'].includes(status) ? status : 'idle');
+    $('meta-' + this.id).textContent =
+      `下一次取序号 #${this.nextSeq} · 已取到 #${this.highFetched} · 该路最近合批 ${o.last_batch_size ?? '–'} 路`;
+  }
+}
+
+const panels = {A: new OrderPanel('A'), B: new OrderPanel('B')};
+
+async function refreshGlobal() {
+  try {
+    const h = await (await fetch('/api/health')).json();
+    $('tick').textContent = h.tick_count;
+    $('batch').textContent = h.last_batch_size;
+  } catch (_) { /* transient */ }
+}
+setInterval(refreshGlobal, 500);
+refreshGlobal();
+// 周期性拉取订单状态，让“停读”的面板也能看到 backlog 涨满与 paused 状态
+setInterval(async () => {
+  try {
+    const r = await (await fetch('/api/orders')).json();
+    for (const o of r.orders) {
+      const p = panels[o.order_id];
+      if (!p) continue;
+      p.generated = o.generated; p.total = o.total; p.ackedSeq = o.acked_seq; p.status = o.status;
+      p.renderStats(o);
+    }
+  } catch (_) { /* transient */ }
+}, 700);
+</script>
+</body>
+</html>
